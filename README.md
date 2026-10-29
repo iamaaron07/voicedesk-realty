@@ -1,19 +1,14 @@
 # VoiceDesk Realty
 
-VoiceDesk Realty is a dashboard-first property discovery and AI voice receptionist application. The home page and property catalog are public. Account features, appointment management, and voice session creation require a customer login and are authorized by the FastAPI backend.
+VoiceDesk Realty is an existing Next.js frontend and FastAPI backend for public property browsing, customer accounts, bookings, and Bolna Web Call sessions. Production deployment is split between Vercel (frontend), Render (API), and managed PostgreSQL.
 
-## Stack
+## Local development (PowerShell)
 
-- `frontend/`: Next.js 15, React 19, TypeScript, responsive CSS, and the official `@bolna/web-call` SDK.
-- `backend/`: FastAPI, SQLAlchemy 2, SQLite locally or PostgreSQL, Alembic, bcrypt sessions, and HTTPX provider calls.
-- `backend/seed_database.py`: repeatable seed of 30 fictional Bengaluru listings.
-
-## Start locally (Windows PowerShell)
-
-Use two PowerShell terminals. From the project root, the backend terminal:
+Backend terminal:
 
 ```powershell
 cd D:\voicedesk\backend
+Copy-Item .env.example .env
 python -m pip install -r requirements.txt
 python -m alembic -c alembic.ini upgrade head
 python seed_database.py
@@ -28,33 +23,65 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`. API health check: `http://localhost:8000/api/health`. Copy `backend/.env.example` to `backend/.env` and configure `DATABASE_URL`, `FRONTEND_URL`, and provider credentials as needed. Local SQLite is the default if `DATABASE_URL` is omitted.
+Open `http://localhost:3000`; API health is at `http://localhost:8000/api/health`. Local development uses SQLite when `DATABASE_URL` is blank. Copying `.env.example` is optional if you prefer the defaults. Demo data is created only by the explicit `python seed_database.py` command.
 
-## Checks
+## Production architecture and Render setup
+
+`render.yaml` defines the API service. Connect the existing repository to Render as a Blueprint, review the service plan, set the backend Root Directory to `backend` (already declared), and provide the environment variables listed below in the Render dashboard. The blueprint does not create a database or contain a database URL. Attach a managed PostgreSQL database in a reachable region and set its connection string in `DATABASE_URL`.
+
+Render service commands:
+
+```text
+Build:       pip install -r requirements.txt
+Pre-deploy:  python -m alembic -c alembic.ini upgrade head
+Start:       uvicorn app:app --host 0.0.0.0 --port $PORT
+Health:      /api/health
+```
+
+The Render pre-deploy command applies migrations once per deploy before the new service starts. For a manual migration from the Render Shell, run `python -m alembic -c alembic.ini upgrade head` after the service environment is configured. Do not run the demo seed command against production inventory unless fictional listings are explicitly intended. The safe production override is `python seed_database.py --confirm-production-demo-seed`.
+
+Set these Render variables; enter secret/URL values only in Render, never in source control or chat:
+
+- `APP_ENV=production`
+- `DATABASE_URL` — managed PostgreSQL connection string; `postgres://` and `postgresql://` are normalized to Psycopg 3.
+- `FRONTEND_URL` — exact Vercel frontend origin, for example `https://your-site.vercel.app` (origin only, no path or trailing slash).
+- `COOKIE_SECURE=true`
+- `COOKIE_SAMESITE=none` for the separate Vercel and Render hostnames. Prefer custom frontend/API domains under the same registrable domain; browsers may restrict third-party cookies between unrelated `vercel.app` and `onrender.com` sites.
+- `BOLNA_WEB_CALL_ENABLED=false` initially. Set `BOLNA_API_KEY` and `BOLNA_AGENT_ID` in Render and enable it only after validating the intended account/agent. For post-call summaries, set `BOLNA_WEBHOOK_SECRET` and configure the Bolna webhook URL/header.
+
+The backend requires `DATABASE_URL` and an HTTPS `FRONTEND_URL` in production; it rejects production SQLite and insecure cookies. The SQLAlchemy pool is capped at two connections per process with no overflow. Use a managed connection pooler if the database limit is low or the Render service scales beyond one process.
+
+## Vercel frontend setup
+
+Create a Vercel project for the `frontend` directory (Root Directory: `frontend`). Set the following environment variable for Production and Preview as appropriate, then redeploy after changing it:
+
+- `NEXT_PUBLIC_API_URL` — the Render service’s HTTPS origin, with no API path (for example `https://your-api.onrender.com`).
+
+The production build fails if this variable is missing; local development keeps the `http://localhost:8000` fallback. After the Vercel domain is known, set the exact same origin in Render’s `FRONTEND_URL`, then redeploy both services if their environment changed. With separate Render/Vercel domains, retain `COOKIE_SAMESITE=none` and `COOKIE_SECURE=true`; a shared custom domain is recommended for browser cookie compatibility.
+
+Official references: [Render FastAPI deployment](https://render.com/docs/deploy-fastapi), [Render pre-deploy commands](https://render.com/docs/deploys), and [Vercel Python runtime](https://vercel.com/docs/functions/runtimes/python).
+
+## Environment variable names
+
+Backend: `APP_ENV`, `DATABASE_URL`, `FRONTEND_URL`, `COOKIE_SECURE`, `COOKIE_SAMESITE`, `BOLNA_API_KEY`, `BOLNA_AGENT_ID`, `BOLNA_WEB_CALL_ENABLED`, `BOLNA_WEBHOOK_SECRET`. `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, and `EMAIL_PROVIDER_API_KEY` are retained as placeholders only; Google Calendar and email/password-reset integrations are not implemented.
+
+Frontend: `NEXT_PUBLIC_API_URL`.
+
+Never put backend credentials in `NEXT_PUBLIC_*` variables. Keep local `.env` files untracked.
+
+## Authentication and integration status
+
+Registration assigns the customer role, passwords are bcrypt-hashed, and sessions are opaque HttpOnly cookies stored as server-side digests. CORS is restricted to `FRONTEND_URL`; state-changing requests reject an explicitly untrusted `Origin`, and production requires the browser `Origin` header except for the Bolna webhook (which uses its own secret). No real Bolna call is claimed by this project status. Google Calendar and email workflows are not connected. Booking records are local requests (status `requested` or `rescheduled`); they do not imply a calendar event or external agent confirmation.
+
+Review `IMPROVEMENT.md` for the latest verified checks and production limitations. Tests/build:
 
 ```powershell
+cd D:\voicedesk\backend
+python -m pytest -q -p no:cacheprovider
 cd D:\voicedesk\frontend
 npm run typecheck
 npm run lint
 npm test
+$env:NEXT_PUBLIC_API_URL='https://api.example.invalid'
 npm run build
-cd ..\backend
-python -m alembic -c alembic.ini upgrade head
-python -m pytest -q -p no:cacheprovider
 ```
-
-## Authentication and roles
-
-Public registration collects email/password only and always creates a customer. Passwords use bcrypt hashes; sessions use opaque HttpOnly cookies with server-side token digests. Configure `COOKIE_SECURE=true` behind HTTPS. Staff users must be provisioned from a trusted shell: `python create_user.py email@example.com --role agent` or `--role admin`; no registration field can grant a staff role. Public browsing does not require login. Saved listings, bookings, call history, and voice session routes do.
-
-## Bolna voice
-
-The browser uses `@bolna/web-call` and requests a short-lived session from authenticated `POST /api/voice/session`. Only the backend sends `BOLNA_API_KEY` to Bolna. The browser starts the microphone and call only after the user presses the call button. Set `BOLNA_API_KEY`, `BOLNA_AGENT_ID`, and `BOLNA_WEB_CALL_ENABLED=true` in the backend environment. Configure the agent's Bolna webhook URL as `https://YOUR_API/api/integrations/bolna/webhook`, set the same random `BOLNA_WEBHOOK_SECRET` in Bolna's custom webhook headers as `X-VoiceDesk-Webhook-Secret`, and in `backend/.env`. Call summaries are stored without transcripts. See [Bolna Web Call SDK](https://github.com/bolna-ai/web-call) and [Bolna post-call webhooks](https://www.bolna.ai/docs/post-call/polling-call-status-webhooks).
-
-## Current integration boundaries
-
-Booking conflicts, idempotency, cancellation, and rescheduling are checked by the API. Calendar event creation and transactional email delivery are not connected yet; current calendar status is explicitly demo mode. Password reset reports a setup message when email is not configured; a complete reset-token workflow is not implemented. Agent leads and staff admin pages remain limited foundations rather than full workspaces. Do not describe the voice call as browser-tested until a user starts an actual call on an authorized browser with microphone access.
-
-## Environment safety
-
-Keep `backend/.env` out of source control and never place provider secrets in `NEXT_PUBLIC_*` variables. Rotate any previously exposed Bolna key before live use. Production also needs HTTPS, secure cookies, a durable database, distributed rate limiting, and a reviewed privacy/retention policy.

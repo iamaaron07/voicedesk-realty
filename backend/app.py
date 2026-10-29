@@ -2,11 +2,13 @@ import os, secrets, re, logging, time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse
 from fastapi import FastAPI, Depends, HTTPException, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, String, Integer, Boolean, DateTime, ForeignKey, UniqueConstraint, JSON, select, and_, func
+from sqlalchemy import create_engine, String, Integer, Boolean, DateTime, ForeignKey, UniqueConstraint, JSON, select, func, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session
 import bcrypt
 import httpx
@@ -19,14 +21,53 @@ try:
 except ImportError:
     pass
 
-DB_URL = os.getenv("DATABASE_URL", "sqlite:///./voicedesk.db")
-engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
+APP_ENV = os.getenv("APP_ENV", "production" if os.getenv("RENDER") else "development").strip().lower()
+PRODUCTION = APP_ENV == "production"
+
+def database_url_from_env(app_env: str | None = None) -> str:
+    configured = os.getenv("DATABASE_URL", "").strip()
+    if not configured:
+        if (app_env if app_env is not None else APP_ENV).lower() == "production":
+            raise RuntimeError("DATABASE_URL must be configured in production.")
+        return "sqlite:///./voicedesk.db"
+    return normalize_database_url(configured)
+
+def normalize_database_url(configured: str) -> str:
+    if configured.startswith("postgres://"):
+        return "postgresql+psycopg://" + configured[len("postgres://"):]
+    if configured.startswith("postgresql://"):
+        return "postgresql+psycopg://" + configured[len("postgresql://"):]
+    return configured
+
+def create_database_engine(database_url: str | None = None, app_env: str | None = None):
+    env = (app_env if app_env is not None else APP_ENV).lower()
+    url = normalize_database_url(database_url) if database_url else database_url_from_env()
+    if env == "production" and url.startswith("sqlite"):
+        raise RuntimeError("SQLite is not supported for production DATABASE_URL.")
+    if url.startswith("sqlite"):
+        return create_engine(url, connect_args={"check_same_thread": False}, pool_pre_ping=True)
+    return create_engine(url, pool_size=2, max_overflow=0, pool_timeout=15, pool_recycle=300, pool_pre_ping=True)
+
+DB_URL = database_url_from_env()
+engine = create_database_engine(DB_URL)
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
 log = logging.getLogger("voicedesk")
 _voice_hits=defaultdict(deque);_voice_lock=Lock()
 _request_hits=defaultdict(deque);_request_lock=Lock()
 SESSION_DAYS = 7
 COOKIE = "voicedesk_session"
+def cookie_settings(app_env: str, secure_value: str | None = None, samesite_value: str | None = None):
+    secure = (secure_value if secure_value is not None else os.getenv("COOKIE_SECURE", "true" if app_env == "production" else "false")).lower() == "true"
+    same_site = (samesite_value if samesite_value is not None else os.getenv("COOKIE_SAMESITE", "none" if app_env == "production" else "lax")).lower()
+    if same_site not in {"lax", "strict", "none"}:
+        raise RuntimeError("COOKIE_SAMESITE must be lax, strict, or none.")
+    if app_env == "production" and not secure:
+        raise RuntimeError("COOKIE_SECURE must be true in production.")
+    if same_site == "none" and not secure:
+        raise RuntimeError("COOKIE_SAMESITE=none requires COOKIE_SECURE=true.")
+    return secure, same_site
+
+COOKIE_SECURE, COOKIE_SAMESITE = cookie_settings(APP_ENV)
 
 class Base(DeclarativeBase): pass
 class User(Base):
@@ -94,7 +135,7 @@ class Booking(Base):
     agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id"), index=True)
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    status: Mapped[str] = mapped_column(String(24), default="confirmed")
+    status: Mapped[str] = mapped_column(String(24), default="requested")
     calendar_event_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(120))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda:datetime.now(timezone.utc))
@@ -123,20 +164,26 @@ class CallRecord(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda:datetime.now(timezone.utc))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-Base.metadata.create_all(engine)
-with SessionLocal() as db:
-    if not db.scalar(select(Property.id).limit(1)):
-        db.add_all([Property(title="Sunlit residence in Indiranagar", locality="Indiranagar", price=68000, beds=2, description="A thoughtfully planned home close to cafés and metro links.",deposit=204000,amenities=["Lift","Balcony"]), Property(title="Garden-facing home in Whitefield", locality="Whitefield", price=52000, beds=3, description="Bright, spacious living with landscaped community spaces.",deposit=156000,amenities=["Garden","Parking"]), Property(title="Calm Koramangala apartment", locality="Koramangala", price=74000, beds=2, description="Modern interiors in a well-connected central neighborhood.",deposit=222000,amenities=["Gym","Security"]), Property(title="HSR family home", locality="HSR Layout", price=46000, beds=3, description="Generous rooms and everyday conveniences nearby.",deposit=138000,amenities=["Balcony","Parking"])])
-    if not db.scalar(select(Agency.id).limit(1)):
-        agency=Agency(name="VoiceDesk Demo Realty");db.add(agency);db.flush()
-        agents=[Agent(agency_id=agency.id,name=n) for n in ["Asha Rao","Kiran Mehta","Neha Iyer","Rohan Shah","Maya Nair"]];db.add_all(agents);db.flush()
-        for idx, prop in enumerate(db.scalars(select(Property)).all()): prop.assigned_agent_id=agents[idx%len(agents)].id
-        db.commit()
-
 app = FastAPI(title="VoiceDesk Realty API", version="1.0")
-app.add_middleware(CORSMiddleware, allow_origins=[os.getenv("FRONTEND_URL", "http://localhost:3000")], allow_credentials=True, allow_methods=["GET","POST","DELETE"], allow_headers=["Content-Type"])
+def validate_frontend_origin(origin: str, app_env: str) -> str:
+    origin = origin.strip().rstrip("/")
+    if app_env == "production":
+        parsed_frontend = urlparse(origin)
+        if parsed_frontend.scheme != "https" or not parsed_frontend.netloc or parsed_frontend.path not in ("", "/") or parsed_frontend.query or parsed_frontend.fragment:
+            raise RuntimeError("FRONTEND_URL must be the exact HTTPS frontend origin in production.")
+    return origin
+
+frontend_origin = validate_frontend_origin(os.getenv("FRONTEND_URL", "http://localhost:3000"), APP_ENV)
+allowed_origins = {frontend_origin}
+app.add_middleware(CORSMiddleware, allow_origins=sorted(allowed_origins), allow_credentials=True, allow_methods=["GET","POST","DELETE","OPTIONS"], allow_headers=["Content-Type"])
 @app.middleware("http")
 async def auth_rate_limit(request:Request,call_next):
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path != "/api/integrations/bolna/webhook":
+        origin=request.headers.get("origin")
+        if origin and origin.rstrip("/") not in allowed_origins:
+            return JSONResponse(status_code=403,content={"detail":"Request origin is not allowed."})
+        if PRODUCTION and not origin:
+            return JSONResponse(status_code=403,content={"detail":"A valid request origin is required."})
     if request.method=="POST" and request.url.path in ("/api/auth/login","/api/auth/register","/api/auth/password-reset"):
         ip=request.client.host if request.client else "unknown";now=time.monotonic()
         with _request_lock:
@@ -183,13 +230,19 @@ def issue_session(response: Response, db: Session, user: User):
     token=secrets.token_urlsafe(32)
     db.add(SessionRow(token_hash=digest(token),user_id=user.id,expires_at=datetime.now(timezone.utc)+timedelta(days=SESSION_DAYS)))
     db.commit()
-    response.set_cookie(COOKIE,token,httponly=True,secure=os.getenv("COOKIE_SECURE","false").lower()=="true",samesite="lax",max_age=SESSION_DAYS*86400,path="/")
+    response.set_cookie(COOKIE,token,httponly=True,secure=COOKIE_SECURE,samesite=COOKIE_SAMESITE,max_age=SESSION_DAYS*86400,path="/")
 def public_user(user): return {"id":user.id,"email":user.email,"role":user.role}
 @app.get("/api/health")
-def health(): return {"status":"ok"}
+def health(db: Session=Depends(db_dep)):
+    try:
+        db.execute(text("SELECT 1"))
+    except SQLAlchemyError:
+        raise HTTPException(503,"Database unavailable.")
+    return {"status":"ok"}
 @app.get("/api/integrations/status")
 def integrations_status():
-    return {"bolna":{"configured":bool(os.getenv("BOLNA_API_KEY") and os.getenv("BOLNA_AGENT_ID") and os.getenv("BOLNA_WEB_CALL_ENABLED","true").lower() in ("1","true","yes"))},"google_calendar":{"configured":bool(os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET")),"mode":"not_connected"},"email":{"configured":bool(os.getenv("EMAIL_PROVIDER_API_KEY")),"mode":"not_configured"}}
+    bolna_ready=bool(os.getenv("BOLNA_API_KEY") and os.getenv("BOLNA_AGENT_ID") and os.getenv("BOLNA_WEB_CALL_ENABLED","true").lower() in ("1","true","yes"))
+    return {"bolna":{"configured":bolna_ready,"mode":"credentials_present" if bolna_ready else "not_configured"},"google_calendar":{"configured":False,"mode":"not_implemented"},"email":{"configured":False,"mode":"not_implemented"}}
 @app.get("/api/properties")
 def properties(q: str="", min_price:int|None=None,max_price:int|None=None,beds:int|None=None,furnishing:str|None=None,property_type:str|None=None,transaction_type:str|None=None,sort:str="price_asc",offset:int=0,limit:int=20,db: Session=Depends(db_dep)):
     stmt=select(Property).where(Property.available.is_(True))
@@ -234,14 +287,14 @@ def logout(request: Request,response: Response,db: Session=Depends(db_dep)):
     if token:
         row=db.get(SessionRow,digest(token))
         if row: db.delete(row); db.commit()
-    response.delete_cookie(COOKIE,path="/",httponly=True,samesite="lax"); return {"ok":True}
+    response.delete_cookie(COOKIE,path="/",httponly=True,secure=COOKIE_SECURE,samesite=COOKIE_SAMESITE); return {"ok":True}
 @app.post("/api/auth/password-reset")
 def password_reset(data: ResetRequest):
     if not valid_email(data.email): raise HTTPException(422,"Enter a valid email address.")
     if not os.getenv("EMAIL_PROVIDER_API_KEY"): raise HTTPException(503,"Password reset email is not configured. Contact the site administrator.")
     raise HTTPException(501,"Password reset delivery is configured but reset workflow is not yet enabled.")
 @app.post("/api/voice/session")
-async def voice_session(user: User=Depends(current_user)):
+async def voice_session(user: User=Depends(current_user),db:Session=Depends(db_dep)):
     now=datetime.now(timezone.utc).timestamp()
     with _voice_lock:
         hits=_voice_hits[user.id]
@@ -266,8 +319,7 @@ async def voice_session(user: User=Depends(current_user)):
         if not run_id or str(payload.get("agent_id", agent_id)) != agent_id:
             log.error("Bolna returned an invalid web-call session payload")
             raise HTTPException(502,"The voice service returned an invalid session.")
-        with SessionLocal() as db:
-            db.add(CallRecord(user_id=user.id,execution_id=str(run_id),agent_id=agent_id,status="session_issued"));db.commit()
+        db.add(CallRecord(user_id=user.id,execution_id=str(run_id),agent_id=agent_id,status="session_issued"));db.commit()
         return payload
     except httpx.TimeoutException:
         raise HTTPException(504,"The voice service took too long to respond. Please retry.")
@@ -282,6 +334,11 @@ def booking_json(b:Booking,db:Session):
     start=b.start_at.replace(tzinfo=timezone.utc) if b.start_at.tzinfo is None else b.start_at
     end=b.end_at.replace(tzinfo=timezone.utc) if b.end_at.tzinfo is None else b.end_at
     return {"id":b.id,"property_id":b.property_id,"property_title":p.title if p else "","agent":a.name if a else "","start_at":start.isoformat(),"end_at":end.isoformat(),"status":b.status,"calendar_mode":"demo (no Google Calendar event created)" if not b.calendar_event_id else "connected"}
+def lock_booking_slots(db:Session):
+    # Serialize overlap checks on PostgreSQL so concurrent API workers cannot
+    # both accept the same agent/time window. SQLite serializes writers itself.
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(731942018)"))
 @app.post("/api/bookings")
 def create_booking(data:BookingRequest,user:User=Depends(current_user),db:Session=Depends(db_dep)):
     start=data.start_at
@@ -292,10 +349,11 @@ def create_booking(data:BookingRequest,user:User=Depends(current_user),db:Sessio
     if existing: return booking_json(existing,db)
     prop=db.get(Property,data.property_id)
     if not prop or not prop.available: raise HTTPException(404,"This property is no longer available.")
+    lock_booking_slots(db)
     agents=db.scalars(select(Agent).where(Agent.active.is_(True),Agent.id==prop.assigned_agent_id) if prop.assigned_agent_id else select(Agent).where(Agent.active.is_(True))).all()
-    local=start.astimezone(ZoneInfo("Asia/Kolkata")); agent=next((a for a in agents if local.weekday() in a.weekdays and local.hour>=a.start_hour and (local+timedelta(hours=1)).hour<=a.end_hour and not db.scalar(select(Booking.id).where(Booking.agent_id==a.id,Booking.status.in_(["confirmed","rescheduled"]),Booking.start_at<end,Booking.end_at>start))),None)
+    local=start.astimezone(ZoneInfo("Asia/Kolkata")); agent=next((a for a in agents if local.weekday() in a.weekdays and local.hour>=a.start_hour and (local+timedelta(hours=1)).hour<=a.end_hour and not db.scalar(select(Booking.id).where(Booking.agent_id==a.id,Booking.status.in_(["requested","confirmed","rescheduled"]),Booking.start_at<end,Booking.end_at>start))),None)
     if not agent: raise HTTPException(409,"No agent is available for this appointment time. Choose another slot.")
-    booking=Booking(user_id=user.id,property_id=prop.id,agent_id=agent.id,start_at=start,end_at=end,status="confirmed",idempotency_key=data.idempotency_key)
+    booking=Booking(user_id=user.id,property_id=prop.id,agent_id=agent.id,start_at=start,end_at=end,status="requested",idempotency_key=data.idempotency_key)
     db.add(booking);db.add(WorkflowEvent(user_id=user.id,event_type="booking.created",metadata_json={"property_id":prop.id,"agent_id":agent.id,"calendar":"unconfigured_demo"}));db.commit();db.refresh(booking)
     return booking_json(booking,db)
 @app.post("/api/bookings/{booking_id}/cancel")
@@ -308,15 +366,16 @@ def cancel_booking(booking_id:int,user:User=Depends(current_user),db:Session=Dep
 def reschedule_booking(booking_id:int,data:BookingRequest,user:User=Depends(current_user),db:Session=Depends(db_dep)):
     booking=db.get(Booking,booking_id)
     if not booking or booking.user_id!=user.id: raise HTTPException(404,"Booking not found.")
-    if booking.status not in ("confirmed","rescheduled"): raise HTTPException(409,"This booking can no longer be rescheduled.")
+    if booking.status not in ("requested","confirmed","rescheduled"): raise HTTPException(409,"This booking can no longer be rescheduled.")
     start=data.start_at
     if start.tzinfo is None: raise HTTPException(422,"Appointment time must include its timezone.")
     start=start.astimezone(timezone.utc);end=start+timedelta(hours=1)
     if start<=datetime.now(timezone.utc): raise HTTPException(422,"Choose a future appointment time.")
     if db.scalar(select(Booking.id).where(Booking.user_id==user.id,Booking.idempotency_key==data.idempotency_key,Booking.id!=booking.id)): raise HTTPException(409,"This request key has already been used.")
     prop=db.get(Property,booking.property_id)
+    lock_booking_slots(db)
     agents=db.scalars(select(Agent).where(Agent.active.is_(True),Agent.id==prop.assigned_agent_id) if prop and prop.assigned_agent_id else select(Agent).where(Agent.active.is_(True))).all()
-    local=start.astimezone(ZoneInfo("Asia/Kolkata"));agent=next((a for a in agents if local.weekday() in a.weekdays and local.hour>=a.start_hour and (local+timedelta(hours=1)).hour<=a.end_hour and not db.scalar(select(Booking.id).where(Booking.agent_id==a.id,Booking.id!=booking.id,Booking.status.in_(["confirmed","rescheduled"]),Booking.start_at<end,Booking.end_at>start))),None)
+    local=start.astimezone(ZoneInfo("Asia/Kolkata"));agent=next((a for a in agents if local.weekday() in a.weekdays and local.hour>=a.start_hour and (local+timedelta(hours=1)).hour<=a.end_hour and not db.scalar(select(Booking.id).where(Booking.agent_id==a.id,Booking.id!=booking.id,Booking.status.in_(["requested","confirmed","rescheduled"]),Booking.start_at<end,Booking.end_at>start))),None)
     if not agent: raise HTTPException(409,"No agent is available for this appointment time. Choose another slot.")
     booking.agent_id=agent.id;booking.start_at=start;booking.end_at=end;booking.status="rescheduled";booking.idempotency_key=data.idempotency_key
     db.add(WorkflowEvent(user_id=user.id,event_type="booking.rescheduled",metadata_json={"booking_id":booking.id,"agent_id":agent.id}));db.commit();db.refresh(booking)
