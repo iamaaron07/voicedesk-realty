@@ -27,7 +27,7 @@ Open `http://localhost:3000`; API health is at `http://localhost:8000/api/health
 
 ## Production architecture and Render setup
 
-`render.yaml` defines the API service. Connect the existing repository to Render as a Blueprint, review the service plan, set the backend Root Directory to `backend` (already declared), and provide the environment variables listed below in the Render dashboard. The blueprint does not create a database or contain a database URL. Attach a managed PostgreSQL database in a reachable region and set its connection string in `DATABASE_URL`.
+`render.yaml` defines a free API web service. Connect the existing repository to Render as a Blueprint, set the backend Root Directory to `backend` (already declared), and provide the environment variables listed below in the Render dashboard. This Blueprint does not create a PostgreSQL database. Configure a separate PostgreSQL database and set its connection string in `DATABASE_URL` before starting the backend; production startup fails when `DATABASE_URL` is missing. A free Render web service does not include a database, and Render's free PostgreSQL databases expire after 30 days.
 
 Render service commands:
 
@@ -38,7 +38,7 @@ Start:       uvicorn app:app --host 0.0.0.0 --port $PORT
 Health:      /api/health
 ```
 
-The Render pre-deploy command applies migrations once per deploy before the new service starts. For a manual migration from the Render Shell, run `python -m alembic -c alembic.ini upgrade head` after the service environment is configured. Do not run the demo seed command against production inventory unless fictional listings are explicitly intended. The safe production override is `python seed_database.py --confirm-production-demo-seed`.
+The migration command remains recorded in `render.yaml`, but Render documents pre-deploy commands as available only for paid web services, private services, and background workers. Therefore, on this free web service it will not run automatically. Apply migrations from a trusted environment with the production `DATABASE_URL` configured, running `python -m alembic -c alembic.ini upgrade head` from `backend`, before deploying schema-dependent changes. Do not run the demo seed command against production inventory unless fictional listings are explicitly intended. The safe production override is `python seed_database.py --confirm-production-demo-seed`.
 
 Set these Render variables; enter secret/URL values only in Render, never in source control or chat:
 
