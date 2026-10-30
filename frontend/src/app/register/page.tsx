@@ -1,11 +1,10 @@
 "use client";
+import { API_ORIGIN as api } from "../api-client";
 import { Suspense, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { registrationError, safeInternalPath } from "../auth-utils";
 import { apiErrorMessage } from "../api-errors";
-
-const api=process.env.NEXT_PUBLIC_API_URL||"http://localhost:8000";
 function RegisterForm(){
   const [email,setEmail]=useState(""),[password,setPassword]=useState(""),[confirm,setConfirm]=useState(""),[err,setErr]=useState("");
   const router=useRouter(),params=useSearchParams();

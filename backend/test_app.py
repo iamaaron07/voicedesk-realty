@@ -5,9 +5,9 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool, StaticPool
 
-from app import app, Base, db_dep, Agency, Agent, Property, cookie_settings, create_database_engine, database_url_from_env, validate_frontend_origin
+from app import app, Base, db_dep, Agency, Agent, Property, cookie_settings, create_database_engine, database_url_from_env, default_app_environment, validate_frontend_origin
 
 @pytest.fixture
 def client():
@@ -66,7 +66,7 @@ def test_integration_status_does_not_claim_unimplemented_providers(client,monkey
     assert "configured-placeholder" not in str(result)
 
 def test_health_checks_database_and_untrusted_origin_is_rejected(client):
-    assert client.get("/api/health").json()=={"status":"ok"}
+    assert client.get("/api/health").json()=={"status":"ok","database":"ok"}
     cors=client.get("/api/properties",headers={"Origin":"http://localhost:3000"})
     assert cors.headers["access-control-allow-origin"]=="http://localhost:3000"
     assert cors.headers["access-control-allow-credentials"]=="true"
@@ -89,6 +89,32 @@ def test_postgres_url_normalization_and_small_pool():
         assert engine.pool._pre_ping is True
     finally:
         engine.dispose()
+
+def test_vercel_engine_does_not_retain_connection_pool(monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    engine=create_database_engine("postgresql://unit:unit@localhost/voicedesk","production")
+    try:
+        assert isinstance(engine.pool,NullPool)
+    finally:
+        engine.dispose()
+
+def test_vercel_environment_defaults_to_production(monkeypatch):
+    monkeypatch.delenv("APP_ENV",raising=False)
+    monkeypatch.setenv("VERCEL_ENV","production")
+    assert default_app_environment()=="production"
+    monkeypatch.delenv("VERCEL_ENV")
+    monkeypatch.delenv("VERCEL",raising=False)
+    monkeypatch.delenv("RENDER",raising=False)
+    assert default_app_environment()=="development"
+
+def test_voice_is_disabled_by_default(client,monkeypatch):
+    monkeypatch.setenv("BOLNA_API_KEY","configured-test-key")
+    monkeypatch.setenv("BOLNA_AGENT_ID","configured-test-agent")
+    monkeypatch.delenv("BOLNA_WEB_CALL_ENABLED",raising=False)
+    assert client.get("/api/integrations/status").json()["bolna"]["configured"] is False
+    register(client)
+    response=client.post("/api/voice/session")
+    assert response.status_code==503
 
 def test_production_cookie_requires_secure_flag():
     assert cookie_settings("production")== (True,"none")
@@ -142,6 +168,16 @@ def test_demo_seed_refuses_production_without_explicit_confirmation(monkeypatch)
     import sys
     from seed_database import main
     monkeypatch.setenv("APP_ENV","production")
+    monkeypatch.setattr(sys,"argv",["seed_database.py"])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code==2
+
+def test_demo_seed_refuses_vercel_production_without_confirmation(monkeypatch):
+    import sys
+    from seed_database import main
+    monkeypatch.delenv("APP_ENV",raising=False)
+    monkeypatch.setenv("VERCEL_ENV","production")
     monkeypatch.setattr(sys,"argv",["seed_database.py"])
     with pytest.raises(SystemExit) as error:
         main()

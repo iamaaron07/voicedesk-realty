@@ -1,9 +1,8 @@
 "use client";
+import { API_ORIGIN as api } from "../api-client";
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-
-const api=process.env.NEXT_PUBLIC_API_URL||"http://localhost:8000";
 type Booking={id:number;property_title:string;start_at:string;status:string;calendar_mode:string};
 type Property={id:number;title:string;locality:string;price:number};
 type Call={id:string;status:string;summary:string|null;duration_seconds:number|null;started_at:string};

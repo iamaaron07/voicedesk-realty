@@ -1,9 +1,8 @@
 "use client";
+import { API_ORIGIN as api } from "../api-client";
 import {useState} from "react";
 import Link from "next/link";
 import {apiErrorMessage} from "../api-errors";
-
-const api=process.env.NEXT_PUBLIC_API_URL||"http://localhost:8000";
 export default function Reset(){
   const [email,setEmail]=useState(""),[msg,setMsg]=useState("");
   async function submit(e:React.FormEvent){

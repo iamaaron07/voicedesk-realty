@@ -20,11 +20,15 @@ backend/.venv/
 # Node.js dependencies
 node_modules/
 frontend/node_modules/
+.vercel/
+frontend/.vercel/
 
 # Next.js build output
 .next/
 frontend/.next/
 frontend/next-env.d.ts
+frontend/coverage/
+*.tsbuildinfo
 
 # Logs
 *.log

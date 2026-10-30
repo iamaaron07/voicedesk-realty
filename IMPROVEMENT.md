@@ -1,134 +1,98 @@
 # VoiceDesk Realty — implementation and verification status
 
-**Updated:** 2026-10-29
+**Updated:** 2026-10-30
 
-## Production deployment readiness update (2026-10-29)
+**Deployment target:** Next.js on Vercel, FastAPI on Vercel Python Functions, Neon PostgreSQL.
 
-Target architecture is Next.js on Vercel, FastAPI on Render, and managed PostgreSQL. No deployment or external service changes were made.
+**Deployment status:** code and configuration prepared locally; no GitHub push, Vercel deployment, Neon project, production migration, or external integration was performed.
 
-- Removed table creation, demo listing insertion, and demo agency/agent insertion from `app.py` import. Schema changes now go through Alembic; demo listing generation is a separate `seed_database.py` command and requires an explicit production override.
-- Production startup requires `APP_ENV=production`, a PostgreSQL `DATABASE_URL`, a valid HTTPS `FRONTEND_URL`, and secure cookies. SQLite remains the local development fallback only. Render `postgres://` and `postgresql://` URLs are normalized to the installed Psycopg 3 driver.
-- PostgreSQL SQLAlchemy pools are capped at 2 connections per worker with no overflow and pre-ping. Alembic online and offline modes now resolve the same `DATABASE_URL` as the application.
-- `/api/health` checks a database query and returns 503 if it cannot reach the database. Production CORS is exact-origin credentialed CORS. State-changing requests reject untrusted origins and production requests without an Origin header; Bolna webhook auth remains shared-secret based.
-- Cookies are HttpOnly; production enforces `COOKIE_SECURE=true` and supports configurable `COOKIE_SAMESITE` (Render template uses `none` for separate Vercel/Render sites). Third-party cookie restrictions remain a browser/platform consideration; use same-site custom domains when possible.
-- Bolna master credentials remain backend-only. The session route still requires an authenticated user. The webhook still requires `BOLNA_WEBHOOK_SECRET` and matching configured agent ID. No Bolna request/call was performed during this deployment-readiness task.
-- Production frontend builds now require `NEXT_PUBLIC_API_URL`; on Vercel it must be HTTPS. Local development keeps its localhost fallback. The dashboard now shows a clear property API outage message.
-- Added `render.yaml` with backend root, build/pre-deploy migration/start commands, health check, secure production settings, and secret placeholders. It does not provision a database. The pre-deploy command needs a Render plan that supports pre-deploy commands.
+## Changes in this deployment-readiness pass
 
-### Validation for this update
+- Updated `backend/app.py` to use SQLAlchemy `NullPool` when Vercel environment variables are present. This avoids retaining a small pool in every serverless function instance; the app should use Neon's pooled connection URI.
+- `/api/health` now reports both application and database status (`{"status":"ok","database":"ok"}`) and responds with 503 when the database query fails.
+- Bolna calling is now disabled by default in application checks and `backend/.env.example`. The ignored local `backend/.env` was sanitized without displaying values: Bolna key, agent, and webhook secret entries are empty and the feature flag is false. Do not reuse the previously exposed key; rotate it with Bolna before any voice test.
+- Production demo seeding now also recognizes Vercel platform variables and keeps its explicit confirmation guard when `APP_ENV` is absent.
+- Added regression tests for Vercel `NullPool` selection, default-disabled voice, and the health response.
+- Added `frontend/.env.example` with a local-only API origin. `.gitignore` now ignores Vercel metadata, frontend coverage, and TypeScript build info.
+- Centralized frontend API origin handling in `frontend/src/app/api-client.ts`: localhost is selected only in development, production requires the configured HTTPS `NEXT_PUBLIC_API_URL`, and a unit test covers both behaviors.
+- Set `backend/.python-version` to Vercel's supported minor-version format (`3.13`).
+- Replaced Render deployment guidance in `README.md` with Vercel frontend/backend and Neon PostgreSQL setup, migration instructions, exact environment variable names, cookie/CORS guidance, feature status, and troubleshooting.
+- Removed the obsolete `render.yaml`; no Render resource is part of the target architecture.
 
-- Backend test suite: **16 passed** (including production database URL/driver/pool checks, HTTPS origin and cookie settings, database health, rejected foreign Origin, authenticated Bolna request construction/key isolation, webhook authentication, truthful integration status, and production seed guard).
-- Frontend TypeScript: passed.
-- Frontend ESLint: passed.
-- Frontend Vitest: **9 passed**.
-- Frontend Next.js production build: passed with `NEXT_PUBLIC_API_URL` set to a safe example HTTPS origin for compile-time validation; no real API URL is stored in the project.
-- Backend Python compilation: passed. Fresh SQLite Alembic migration and repeat upgrade passed. Separate isolated migration + seed run produced 30 fictional properties. Importing `app` against a fresh SQLite path did not create a database file.
-- Production-mode import configuration check passed using a nonconnecting test PostgreSQL URL: Psycopg 3 driver, pool size 2, overflow 0, secure cookie, and `SameSite=None` were selected without opening a DB connection.
-- Fresh managed PostgreSQL connectivity/migration has not been tested. Render must apply migrations after its environment is configured.
+## Architecture and Vercel settings
 
-### Remaining deployment tasks and risks
+Both Vercel projects use the same GitHub repository and deploy from `main`:
 
-- Configure Render `DATABASE_URL` with the managed PostgreSQL connection string, `FRONTEND_URL` with the final Vercel origin, and apply migrations through Render's pre-deploy command. No production DB URL or credentials are stored in this repo.
-- Configure Vercel `NEXT_PUBLIC_API_URL` with the Render API origin and redeploy. Set the same exact origin in Render `FRONTEND_URL`; redeploy the API after changes.
-- Configure Bolna credentials and webhook in Render/agent settings only if needed. The deployment template disables voice by default and contains no credentials. No real voice call is claimed.
-- Load reviewed production property inventory separately. The seed creates fictional demo listings, not real estate data. Do not run it in production unless fictional listings are intentionally wanted.
-- In-memory auth/voice rate limits are not shared across Render instances. Add a shared rate-limit store before scaling. Booking overlap checks now use a PostgreSQL transaction advisory lock; a live multi-worker PostgreSQL test has not been run.
-- Google Calendar, email, and password reset delivery are not implemented. Existing environment placeholders do not activate these integrations.
+**Frontend project**
 
-### Deployment settings and commands
+- Root Directory: `frontend`.
+- Framework: Next.js, automatically detected.
+- Install: `npm install`; Build: `npm run build` (or Vercel's detected Next.js command).
+- Environment: `NEXT_PUBLIC_API_URL`, set to the backend HTTPS origin without `/api`, path, or trailing slash. Set Production and only configure Preview when its exact origin is allowed by the matching backend environment.
+- Redeploy after changing this build-time variable.
 
-Render Blueprint service commands:
+**Backend project**
 
-```text
-Root Directory: backend
-Build:          pip install -r requirements.txt
-Pre-deploy:     python -m alembic -c alembic.ini upgrade head
-Start:          uvicorn app:app --host 0.0.0.0 --port $PORT
-Health check:   /api/health
-```
+- Root Directory: `backend`.
+- Runtime: Vercel Python; `backend/app.py` exports the FastAPI `app`, and `requirements.txt` declares dependencies. The current Vercel FastAPI/Python convention supports an `app.py` entrypoint at the project root. No Uvicorn start command, persistent process, or custom Vercel config is required for this layout.
+- Python: 3.13 (`backend/.python-version`).
+- Build/output settings: leave automatic; Vercel installs Python dependencies from `requirements.txt`.
+- Environment variables: `APP_ENV`, `DATABASE_URL`, `FRONTEND_URL`, `COOKIE_SECURE`, `COOKIE_SAMESITE`; optional `BOLNA_WEB_CALL_ENABLED`, `BOLNA_API_KEY`, `BOLNA_AGENT_ID`, `BOLNA_WEBHOOK_SECRET`.
+- Production values: `APP_ENV=production`, Neon pooled `DATABASE_URL`, exact frontend origin in `FRONTEND_URL`, `COOKIE_SECURE=true`, `COOKIE_SAMESITE=none`, `BOLNA_WEB_CALL_ENABLED=false` until a replacement Bolna key and agent are verified.
+- Redeploy after changing variables.
 
-Set Render backend variables by name: `APP_ENV`, `DATABASE_URL`, `FRONTEND_URL`, `COOKIE_SECURE`, `COOKIE_SAMESITE`, `BOLNA_WEB_CALL_ENABLED`, `BOLNA_API_KEY`, `BOLNA_AGENT_ID`, and `BOLNA_WEBHOOK_SECRET`. Render template disables Bolna by default. Set `DATABASE_URL` to managed PostgreSQL, `FRONTEND_URL` to the exact deployed Vercel origin, `COOKIE_SECURE=true`, and `COOKIE_SAMESITE=none` for separate Vercel/Render sites. A custom same-site domain is recommended for browser cookie compatibility.
+The backend defaults hosted Vercel/Render environments to production if `APP_ENV` is omitted. Its module import creates an engine but does not connect, create tables, migrate, or seed. A missing production `DATABASE_URL` fails safely; production SQLite is rejected. Alembic reads `DATABASE_URL`, the same variable used by the app. The Vercel-specific SQLAlchemy `NullPool` branch is unit-tested, but no Vercel CLI build or deployed function invocation was run in this environment.
 
-Set Vercel frontend variable `NEXT_PUBLIC_API_URL` to the Render HTTPS API origin for Production (and to the matching staging API in Preview, if configured). Redeploy Vercel after changing this build-time variable. Redeploy Render after changing `FRONTEND_URL` or other service environment settings. Never put Bolna keys in `NEXT_PUBLIC_*` variables.
+## Neon setup and migration procedure
 
-The explicit local commands remain `python -m alembic -c alembic.ini upgrade head` then optionally `python seed_database.py`; the Render pre-deploy command runs migrations and does not seed demo listings.
+1. Create a Neon project/database in a region close to Vercel.
+2. For the backend Production `DATABASE_URL`, copy the pooled PostgreSQL URI from Neon Console (**Connect**, pooling enabled; pooled host includes `-pooler`). Neon recommends pooled connections for serverless traffic and direct connections for schema migrations.
+3. Before first deployment and after schema changes, use a protected workstation/CI environment with the Neon direct (non-pooled) URI set as `DATABASE_URL`, then run from `backend`:
 
-## Earlier implementation summary (2026-10-28)
+   ```powershell
+   python -m alembic -c alembic.ini upgrade head
+   python -m alembic -c alembic.ini current
+   ```
 
-Continued the existing VoiceDesk project. The root page is the public dashboard, listing search/detail pages are public, and account/voice actions require email/password login. Frontend dependencies, including official `@bolna/web-call` 3.0.1, are now installed and locked. Frontend typecheck, lint, unit tests, production build, API tests, SQLite migration, seed, and local API smoke checks have been run. No real microphone call was initiated.
+4. Configure the backend Vercel variables and deploy. Check `/api/health`; it queries the configured database and returns 503 if unavailable.
+5. Run `python seed_database.py` only against a chosen development/test database. It creates fictional data. Production requires the explicit `--confirm-production-demo-seed` flag and should not be seeded with fictional listings unless intentionally desired.
 
-## Implemented
+No Neon URL or credential is stored in this repository. Neon connectivity, production migrations, backups, and free-tier account limits remain to be verified by the account owner. Neon free compute can suspend while idle; its current quotas/limits should be checked before launch.
 
-- Public home dashboard with property search, featured properties, product overview, and AI receptionist CTA; public catalog and property detail.
-- Email/password registration and login, validation, password visibility, safe internal `next` redirect, customer-default roles, bcrypt hashes, HttpOnly session cookie, server-side session digest and logout invalidation.
-- Protected customer saved homes, bookings, call history, and voice session endpoint. Agent/admin sample endpoints reject customer role.
-- Bolna browser SDK integration. Authenticated backend mints sessions using the official Web Call endpoint and server-only bearer key. Browser explicitly starts only on user action. User call-start association and an authenticated personal call-history endpoint are in place.
-- `CallRecord` persistence and an idempotent Bolna webhook endpoint store status, duration, and summary only; transcript content is not saved. Configure the webhook and shared secret as described below before summaries can arrive.
-- Booking creation uses a required idempotency key, future-time and work-window validation, agent overlap checks, cancellation, and rescheduling. Booking statuses are requests, not claims of external agent/calendar confirmation. PostgreSQL overlap checks use a transaction advisory lock; multi-worker PostgreSQL behavior still needs a live integration test.
-- Alembic migration `0002_call_records` and repeatable 30-record fictional listing seed.
-- Responsive shared UI and account page with personal call summaries.
+## Security and feature status
 
-## Verification performed
+- CORS allows the exact configured `FRONTEND_URL` with credentials. State-changing requests reject an untrusted browser `Origin`; production rejects missing Origin except for the separately secret-validated Bolna webhook.
+- Session cookies are HttpOnly; production requires Secure and supports `SameSite=None` for cross-origin requests. Third-party cookie restrictions may affect separate `vercel.app` project domains. Same-site custom frontend/API hostnames are recommended and browser login persistence needs a real deployed-browser check.
+- The browser uses only `NEXT_PUBLIC_API_URL`; private database/Bolna credentials remain backend variables. `NEXT_PUBLIC_API_URL` is validated during production build.
+- Customer role is assigned during registration. Saved properties, bookings, voice sessions, and personal call history require authentication; agent/admin sample endpoints enforce role checks.
+- Public dashboard and property APIs remain public. Booking status is a local request, not a calendar or agent confirmation.
+- Bolna call session requests are authenticated and use a backend key; calling defaults off. This pass did not contact Bolna or start a call. Rotate the previously exposed key, configure the intended agent, then explicitly enable the feature and test from a browser.
+- Google Calendar, email delivery, and complete password reset are not implemented. The password-reset endpoint does not claim to send email. Agent leads and agency administration are limited placeholders.
+- In-memory request/voice rate limits are not distributed across serverless instances. Add a shared rate-limit store before relying on them at scale.
 
-Frontend, from `frontend/`:
+## Validation performed in this pass
 
-- `npm install --offline=false --no-audit --no-fund`: passed; resolved npm registry/dependency issue and generated lockfile.
-- `npm run typecheck`: passed (`tsc --noEmit`).
-- `npm run lint`: passed (ESLint).
-- `npm test`: passed, 9/9 Vitest tests (safe redirect and registration rules).
-- `npm run build`: passed on Next.js 15.5.28; routes compiled and static pages generated.
+- `cd backend; python -m pytest -q -p no:cacheprovider`: **20 passed**.
+- `cd backend; python -m py_compile app.py seed_database.py create_user.py alembic\env.py alembic\versions\0001_initial_schema.py alembic\versions\0002_call_records.py`: passed.
+- Fresh isolated SQLite database: Alembic upgrade ran twice successfully; `alembic current` reported `0002_call_records (head)`; the explicit demo seed ran twice and a count query confirmed 30 fictional properties. The temporary database was removed. No Neon database was used.
+- Vercel-mode production import check with a nonconnecting placeholder PostgreSQL URL: passed; 28 routes loaded, driver normalized to Psycopg 3, `NullPool` selected, and no database connection was attempted.
+- `cd frontend; npm run typecheck`: passed.
+- `cd frontend; npm run lint`: passed (ESLint; Windows execution took longer than 30 seconds but exited 0).
+- `cd frontend; npm test`: **11 passed** across 2 files. The first sandboxed Vitest attempt failed because Windows denied esbuild's child process (`spawn EPERM`); rerun with process permission passed.
+- `cd frontend; $env:NEXT_PUBLIC_API_URL='https://api.example.invalid'; npm run build`: passed on Next.js 15.5.28. The placeholder URL was used only for build validation and is not a production URL.
+- `git diff --check`: passed; Git reported only configured LF/CRLF normalization warnings.
+- API coverage in backend tests includes public property search, health, registration/login/logout/session invalidation, role boundaries, authenticated voice endpoint behavior and master-key isolation in stubbed transport, webhook secret handling, booking idempotency/conflict/cancel/reschedule, cookies, CORS and production configuration helpers.
+- No browser/device emulation, Vercel CLI build/deploy, external database connection, Neon migration, live credential check, Bolna session, real voice call, or Calendar/email provider test was performed.
 
-Backend, from `backend/`:
+## Remaining manual checks
 
-- `python -m pytest -q -p no:cacheprovider`: **7 passed** in the 2026-10-28 audit; the 2026-10-29 production-readiness run passed **16**.
-- `python -m alembic -c alembic.ini upgrade head`: passed against local SQLite; current revision `0002_call_records`.
-- `python seed_database.py`: ensured 30 demo properties in the earlier audit. This is now an explicit standalone command and is guarded in production.
-- `python -m py_compile app.py seed_database.py create_user.py alembic/env.py alembic/versions/0001_initial_schema.py alembic/versions/0002_call_records.py`: passed.
-- Local production Next server returned HTTP 200 with the dashboard headline. Local Uvicorn returned health `ok`, 30 public properties, and 401 for unauthenticated private call history.
-- Responsive behavior was checked by reviewing the existing 850px/550px CSS breakpoints; no real browser device emulation/visual inspection was available.
+1. Create/configure Neon, save its pooled URI as backend Production `DATABASE_URL`, and run the migration commands above using a direct URI before initial use.
+2. Create two Vercel projects from the same GitHub repository with root directories `frontend` and `backend` respectively; connect both to `main` for push-triggered deployment.
+3. Set backend Production variables (`APP_ENV`, `DATABASE_URL`, `FRONTEND_URL`, `COOKIE_SECURE`, `COOKIE_SAMESITE`) in Vercel. Keep Bolna disabled and omit credentials until a replacement is configured.
+4. Set frontend Production `NEXT_PUBLIC_API_URL` to the deployed backend origin; redeploy frontend. Ensure backend `FRONTEND_URL` exactly matches the frontend's final origin; redeploy backend.
+5. Verify `/api/health`, public listing search/detail, registration, login, persisted account access, logout, protected voice redirect, and microphone flow in a real browser. Browser cookie policy may require same-site custom domains.
+6. Confirm deployments are healthy and check Vercel/Neon current free-tier usage and execution limits. No push or deployment has been initiated.
 
-One sandboxed Vitest run failed because Node could not spawn esbuild (`EPERM`); the same frontend suite was rerun with permitted process execution and passed. App imports no longer create tables or seed records.
+## Final validation results
 
-## Bolna integration and credential status
-
-Reviewed the [official Web Call SDK](https://github.com/bolna-ai/web-call), [API authentication](https://www.bolna.ai/docs/api-reference/introduction), and [post-call webhook docs](https://www.bolna.ai/docs/post-call/polling-call-status-webhooks). The implementation follows the documented server-side `POST https://api.bolna.ai/web-call/freeswitch-session` flow; the master API key is not included in frontend bundles or responses. Short-lived session credentials are returned only to the authenticated browser that requested them.
-
-As of this audit, `BOLNA_API_KEY` and `BOLNA_AGENT_ID` are both set in the local ignored environment. A read-only official Bolna agent lookup returned HTTP 200 and confirmed the key is accepted and the configured agent is accessible. No values were printed. This check does not prove the agent's Web Call configuration, browser permissions, or audio. **No real call was started or claimed.** Rotate the key before live demonstration because prior project context flagged it as potentially exposed, then repeat the safe validity check.
-
-To persist final summaries, configure an externally reachable HTTPS webhook URL in the Bolna agent settings and configure a long random `BOLNA_WEBHOOK_SECRET` in backend env and the matching custom webhook header `X-VoiceDesk-Webhook-Secret`. The code rejects requests without the secret and ignores executions that were not associated with an authenticated user's minted session.
-
-## Integrations and remaining blockers
-
-- **Google Calendar:** not implemented beyond config status and explicit demo calendar labeling. No OAuth consent, token storage, free/busy lookup, event creation, cancellation synchronization, or calendar credentials are present. To enable it, register a Google Cloud OAuth client, authorize Calendar API scopes, complete a secure OAuth/token-storage flow, then test a real calendar. No authorization was performed.
-- **Email and password reset:** no provider send workflow or reset-token completion exists. Password-reset API returns a clear setup error when email configuration is absent and a not-enabled response when only the old API-key flag is set. No email was sent. A transactional provider account, verified sender/domain, and securely stored API key are required, followed by implementation/testing of expiring one-time reset tokens.
-- **Voice summary webhook:** code is ready; provider webhook configuration and external secret setup are still required. Summary delivery was not externally tested.
-- **Staff workspaces:** agent lead endpoint is an empty role-protected placeholder; administrator analytics has basic counts, but full agency user/property management and assignment screens remain incomplete.
-- **Database concurrency:** PostgreSQL advisory locking serializes appointment overlap checks, but no live multi-worker Postgres run was possible here.
-- **CSRF and cookies:** unsafe requests validate Origin and production rejects missing Origin; cookie cross-site browser behavior between Vercel and Render still needs testing. Same-site custom domains are recommended.
-- **Distributed rate limits, PostgreSQL connectivity/migration verification, and full browser/responsive visual coverage** remain.
-
-## Exact local start commands (PowerShell)
-
-Backend terminal:
-
-```powershell
-cd D:\voicedesk\backend
-python -m alembic -c alembic.ini upgrade head
-python seed_database.py
-python -m uvicorn app:app --reload --host 127.0.0.1 --port 8000
-```
-
-Frontend terminal:
-
-```powershell
-cd D:\voicedesk\frontend
-npm run dev
-```
-
-Browse to `http://localhost:3000`; check `http://localhost:8000/api/health` for API status.
-
-## Changelog
-
-- 2026-10-29: prepared Render/Vercel production configuration; removed app import-time schema/seed effects; enforced PostgreSQL and secure cookie settings in production; aligned Alembic URL handling; capped DB pools; added Origin checking, database health, production API URL validation, useful API outage messages, safe separate demo seeding, request-status semantics, and production config/webhook/API tests. Backend 16/16, frontend typecheck/lint/build passed, frontend Vitest 9/9. The Bolna endpoint test stubs the provider transport; no external request or real call was made. No service was deployed.
-- 2026-10-28: installed/locked frontend dependencies and official Bolna SDK; completed frontend check suite; verified Bolna key and agent via read-only API lookup; added persisted call records/webhook summary handler and booking reschedule endpoint; advanced Alembic migration; refreshed implementation documentation.
-- 2026-10-27: dashboard-first experience, auth/session foundation, property search, customer account, booking workflow, Bolna session route, seed data, and baseline project setup.
+Validation commands and outcomes listed above were run during this pass; only external, deployment, and browser checks listed above remain outstanding.

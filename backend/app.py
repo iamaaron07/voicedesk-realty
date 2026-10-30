@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, String, Integer, Boolean, DateTime, ForeignKey, UniqueConstraint, JSON, select, func, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session
+from sqlalchemy.pool import NullPool
 import bcrypt
 import httpx
 from collections import defaultdict, deque
@@ -21,7 +22,12 @@ try:
 except ImportError:
     pass
 
-APP_ENV = os.getenv("APP_ENV", "production" if os.getenv("RENDER") else "development").strip().lower()
+def default_app_environment() -> str:
+    # Hosted platforms must not inherit local-development SQLite defaults just
+    # because APP_ENV was accidentally omitted from their project settings.
+    return "production" if os.getenv("RENDER") or os.getenv("VERCEL") or os.getenv("VERCEL_ENV") else "development"
+
+APP_ENV = os.getenv("APP_ENV", default_app_environment()).strip().lower()
 PRODUCTION = APP_ENV == "production"
 
 def database_url_from_env(app_env: str | None = None) -> str:
@@ -46,6 +52,11 @@ def create_database_engine(database_url: str | None = None, app_env: str | None 
         raise RuntimeError("SQLite is not supported for production DATABASE_URL.")
     if url.startswith("sqlite"):
         return create_engine(url, connect_args={"check_same_thread": False}, pool_pre_ping=True)
+    # Vercel Functions may create many short-lived execution environments. Use
+    # the Neon pooled URL and release each connection after the request instead
+    # of retaining a per-process pool that multiplies across function instances.
+    if os.getenv("VERCEL") or os.getenv("VERCEL_ENV"):
+        return create_engine(url, poolclass=NullPool, pool_pre_ping=True)
     return create_engine(url, pool_size=2, max_overflow=0, pool_timeout=15, pool_recycle=300, pool_pre_ping=True)
 
 DB_URL = database_url_from_env()
@@ -238,10 +249,10 @@ def health(db: Session=Depends(db_dep)):
         db.execute(text("SELECT 1"))
     except SQLAlchemyError:
         raise HTTPException(503,"Database unavailable.")
-    return {"status":"ok"}
+    return {"status":"ok","database":"ok"}
 @app.get("/api/integrations/status")
 def integrations_status():
-    bolna_ready=bool(os.getenv("BOLNA_API_KEY") and os.getenv("BOLNA_AGENT_ID") and os.getenv("BOLNA_WEB_CALL_ENABLED","true").lower() in ("1","true","yes"))
+    bolna_ready=bool(os.getenv("BOLNA_API_KEY") and os.getenv("BOLNA_AGENT_ID") and os.getenv("BOLNA_WEB_CALL_ENABLED","false").lower() in ("1","true","yes"))
     return {"bolna":{"configured":bolna_ready,"mode":"credentials_present" if bolna_ready else "not_configured"},"google_calendar":{"configured":False,"mode":"not_implemented"},"email":{"configured":False,"mode":"not_implemented"}}
 @app.get("/api/properties")
 def properties(q: str="", min_price:int|None=None,max_price:int|None=None,beds:int|None=None,furnishing:str|None=None,property_type:str|None=None,transaction_type:str|None=None,sort:str="price_asc",offset:int=0,limit:int=20,db: Session=Depends(db_dep)):
@@ -302,7 +313,7 @@ async def voice_session(user: User=Depends(current_user),db:Session=Depends(db_d
         if len(hits)>=3: raise HTTPException(429,"Too many call attempts. Please wait a minute and retry.")
         hits.append(now)
     api_key=os.getenv("BOLNA_API_KEY","").strip(); agent_id=os.getenv("BOLNA_AGENT_ID","").strip()
-    if os.getenv("BOLNA_WEB_CALL_ENABLED","true").lower() not in ("1","true","yes") or not api_key or not agent_id:
+    if os.getenv("BOLNA_WEB_CALL_ENABLED","false").lower() not in ("1","true","yes") or not api_key or not agent_id:
         raise HTTPException(503,"Voice calling is not configured yet. Please try again later.")
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:

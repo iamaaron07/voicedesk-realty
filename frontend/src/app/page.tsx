@@ -1,11 +1,12 @@
 "use client";
+import { API_ORIGIN as api } from "./api-client";
 import Link from "next/link";
 import { useEffect,useState } from "react";
 import { Search,Mic2,MapPin } from "lucide-react";
 import SiteHeader from "./components/SiteHeader";
 
 type Property={id:number;title:string;locality:string;price:number;beds:number;description:string;demo:boolean};
-const api=process.env.NEXT_PUBLIC_API_URL||"http://localhost:8000";
+
 const images=[1600210492486,1600607687939,1600566753086,1600585154340];
 export default function Home(){
   const [items,setItems]=useState<Property[]>([]),[q,setQ]=useState(""),[error,setError]=useState("");

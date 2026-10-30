@@ -19,7 +19,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--confirm-production-demo-seed", action="store_true", help="Required before writing fictional listings in production")
     args = parser.parse_args()
-    runtime_env = os.getenv("APP_ENV", "production" if os.getenv("RENDER") else "development").lower()
+    hosted = os.getenv("RENDER") or os.getenv("VERCEL") or os.getenv("VERCEL_ENV")
+    runtime_env = os.getenv("APP_ENV", "production" if hosted else "development").lower()
     if runtime_env == "production" and not args.confirm_production_demo_seed:
         parser.error("Refusing to seed demo data in production without --confirm-production-demo-seed.")
 
