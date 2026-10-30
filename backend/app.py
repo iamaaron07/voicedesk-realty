@@ -1,4 +1,5 @@
 import os, secrets, re, logging, time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -33,8 +34,8 @@ PRODUCTION = APP_ENV == "production"
 def database_url_from_env(app_env: str | None = None) -> str:
     configured = os.getenv("DATABASE_URL", "").strip()
     if not configured:
-        if (app_env if app_env is not None else APP_ENV).lower() == "production":
-            raise RuntimeError("DATABASE_URL must be configured in production.")
+        # Render's free demo service has an ephemeral filesystem. SQLite keeps
+        # the app usable when no managed database has been configured yet.
         return "sqlite:///./voicedesk.db"
     return normalize_database_url(configured)
 
@@ -46,10 +47,7 @@ def normalize_database_url(configured: str) -> str:
     return configured
 
 def create_database_engine(database_url: str | None = None, app_env: str | None = None):
-    env = (app_env if app_env is not None else APP_ENV).lower()
     url = normalize_database_url(database_url) if database_url else database_url_from_env()
-    if env == "production" and url.startswith("sqlite"):
-        raise RuntimeError("SQLite is not supported for production DATABASE_URL.")
     if url.startswith("sqlite"):
         return create_engine(url, connect_args={"check_same_thread": False}, pool_pre_ping=True)
     # Vercel Functions may create many short-lived execution environments. Use
@@ -175,7 +173,16 @@ class CallRecord(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda:datetime.now(timezone.utc))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-app = FastAPI(title="VoiceDesk Realty API", version="1.0")
+def initialize_database() -> None:
+    """Create missing tables on startup; safe to call repeatedly."""
+    Base.metadata.create_all(bind=engine)
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    initialize_database()
+    yield
+
+app = FastAPI(title="VoiceDesk Realty API", version="1.0", lifespan=lifespan)
 def validate_frontend_origin(origin: str, app_env: str) -> str:
     origin = origin.strip().rstrip("/")
     if app_env == "production":

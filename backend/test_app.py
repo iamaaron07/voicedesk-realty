@@ -3,11 +3,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool, StaticPool
 
-from app import app, Base, db_dep, Agency, Agent, Property, cookie_settings, create_database_engine, database_url_from_env, default_app_environment, validate_frontend_origin
+from app import app, Base, db_dep, Agency, Agent, Property, cookie_settings, create_database_engine, database_url_from_env, default_app_environment, initialize_database, validate_frontend_origin
 
 @pytest.fixture
 def client():
@@ -73,13 +73,28 @@ def test_health_checks_database_and_untrusted_origin_is_rejected(client):
     denied=client.post("/api/auth/register",headers={"Origin":"https://untrusted.example"},json={"email":"a@example.com","password":"safePassword123"})
     assert denied.status_code==403
 
-def test_production_database_configuration_requires_postgres(monkeypatch):
+def test_missing_production_database_uses_sqlite_fallback(monkeypatch):
     monkeypatch.delenv("DATABASE_URL",raising=False)
-    with pytest.raises(RuntimeError,match="DATABASE_URL"):
-        database_url_from_env("production")
-    with pytest.raises(RuntimeError,match="SQLite"):
-        create_database_engine("sqlite:///./test.db","production")
+    assert database_url_from_env("production")=="sqlite:///./voicedesk.db"
+    engine=create_database_engine(None,"production")
+    try:
+        assert engine.url.drivername=="sqlite"
+        assert engine.dialect.create_connect_args(engine.url)[1]["check_same_thread"] is False
+    finally:
+        engine.dispose()
     assert database_url_from_env("development")=="sqlite:///./voicedesk.db"
+
+def test_startup_initializes_tables_safely_and_idempotently(monkeypatch):
+    test_engine=create_engine("sqlite://",connect_args={"check_same_thread":False},poolclass=StaticPool)
+    monkeypatch.setattr("app.engine",test_engine)
+    try:
+        initialize_database()
+        first_tables=set(inspect(test_engine).get_table_names())
+        initialize_database()
+        assert "users" in first_tables and "properties" in first_tables
+        assert set(inspect(test_engine).get_table_names())==first_tables
+    finally:
+        test_engine.dispose()
 
 def test_postgres_url_normalization_and_small_pool():
     engine=create_database_engine("postgresql://unit:unit@localhost/voicedesk","production")
